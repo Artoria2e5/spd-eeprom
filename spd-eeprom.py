@@ -29,7 +29,17 @@ except ImportError:
     sys.exit("This operating system is not supported.")
 
 # To determine what functionality is present
-I2C_FUNC_I2C = 0x00000001
+I2C_FUNC_SMBUS_QUICK = 0x00010000
+I2C_FUNC_SMBUS_READ_BYTE = 0x00020000
+I2C_FUNC_SMBUS_WRITE_BYTE = 0x00040000
+I2C_FUNC_SMBUS_READ_BYTE_DATA = 0x00080000
+I2C_FUNC_SMBUS_WRITE_BYTE_DATA = 0x00100000
+I2C_FUNC_SMBUS_READ_WORD_DATA = 0x00200000
+I2C_FUNC_SMBUS_WRITE_WORD_DATA = 0x00400000
+
+REQUIRED_FUNC = I2C_FUNC_SMBUS_READ_BYTE | I2C_FUNC_SMBUS_WRITE_BYTE | \
+                I2C_FUNC_SMBUS_READ_BYTE_DATA | I2C_FUNC_SMBUS_WRITE_BYTE_DATA | \
+                I2C_FUNC_SMBUS_QUICK
 
 # Data for SMBus Messages
 class i2c_smbus_data(ctypes.Union):
@@ -105,6 +115,10 @@ def print_usage():
     print("    -w           write data to SPD EEPROM (input from file)")
     print("    -d DIMM      DIMM slot index (0 - 7)")
     print("    -f FILE      input or output file path")
+    print()
+    print("Environment Variables:")
+    print("    SPD_EEPROM_SMBUS   specify the SMBus index to use (e.g. 1 for /dev/i2c-1)")
+    print()
 
 def spd_set_page(fd, page):
     try:
@@ -213,48 +227,75 @@ def smbus_probe(dimm_slot = None):
     except Exception:
         pass
 
-    smbus_idx = ""
+    fd = None
+    smbus_idx = None
 
     files = os.listdir("/dev")
     files = list(filter(lambda x: x.startswith("i2c-"), files))
 
-    for entry in files:
-        fd = os.open("/dev/" + entry, os.O_RDWR)
-        if not i2c_smbus_get_funcs(fd) & I2C_FUNC_I2C:
-            smbus_idx = entry[4:]
-            break
-
-    if smbus_idx.isdigit():
-        smbus_idx = int(smbus_idx)
+    if os.getenv("SPD_EEPROM_SMBUS") is not None:
+        fd, smbus_idx, n = try_smbus("i2c-" + os.getenv("SPD_EEPROM_SMBUS"), dimm_slot)
+        if fd is None:
+            sys.exit("Could not access SMBus %s." % os.getenv("SPD_EEPROM_SMBUS"))
+        else:
+            return fd, smbus_idx
     else:
-        sys.exit("No SMBus adapter found.")
+        rets = [try_smbus(x, dimm_slot) for x in files]
+        rets = list(filter(lambda x: x[0] is not None, rets))
+        rets = sorted(rets, key=lambda x: x[2], reverse=True)
+        if len(rets) == 0:
+            sys.exit("No supported SMBus found.")
+        else:
+            fd, smbus_idx = rets[0][0], rets[0][1]
+            print("Selecting /dev/i2c-%d by EEPROM count" % smbus_idx)
+            return fd, smbus_idx
 
-    if dimm_slot == None:
-        print("Probing for SPD EEPROM on SMBus %d" % smbus_idx)
+
+def try_smbus(file: str, dimm_slot = None):
+    fd = os.open("/dev/" + file, os.O_RDWR)
+    smbus_name: str = file[4:]
+    if i2c_smbus_get_funcs(fd) & REQUIRED_FUNC != REQUIRED_FUNC:
+        print("I2C adapter %s does not support required SMBus functions." % file)
         print()
+        os.close(fd)
+        return None, None, None
 
+    if smbus_name.isdigit():
+        smbus_idx: int = int(smbus_name)
+    else:
+        print("Invalid SMBus index: %s" % smbus_name)
+        return None, None, None
+
+    print("Probing for SPD EEPROM on SMBus %d" % smbus_idx)
+    if dimm_slot is None:
         eeprom = 0
         ee1004 = spd_set_page(fd, 0)
 
         for slot in range(0, 8):
             try:
                 i2c_smbus_read_byte(fd, 0x50 + slot)
-
                 print("DIMM slot %d: %s SPD EEPROM" % (slot, "512 Byte EE1004" if ee1004 else "256 Byte AT24"))
-
                 eeprom += 1
             except IOError:
                 pass
 
         if eeprom == 0:
-            print("No SPD EEPROM detected.")
+            print("No SPD EEPROM detected on SMBus %d." % smbus_idx)
+            print()
+            os.close(fd)
+            return None, None, None
     else:
         try:
             i2c_smbus_read_byte(fd, 0x50 + dimm_slot)
+            eeprom = 1
         except IOError:
-            sys.exit("DIMM slot %d is empty." % dimm_slot)
+            print("DIMM slot %d is empty." % dimm_slot)
+            os.close(fd)
+            print()
+            return None, None, None
 
-        return fd, smbus_idx
+    print()
+    return fd, smbus_idx, eeprom
 
 def main():
     if os.getuid():
@@ -266,7 +307,7 @@ def main():
         sys.exit(print_usage())
 
     op_code = 0
-    dimm_slot = ""
+    dimm_slot = None
     file_path = ""
 
     for opt, arg in opts:
@@ -282,7 +323,9 @@ def main():
             file_path = arg
 
     if op_code == 1 and len(opts) == 1:
-        smbus_probe()
+        _, smbus_idx = smbus_probe()
+        print("To save time for next time, you can specify the SMBus index" \
+        " by: `export SPD_EEPROM_SMBUS=%d`." % smbus_idx)
     elif op_code != 0 \
         and len(opts) == 3 \
         and len(file_path) != 0 \
